@@ -3,7 +3,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <future>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -12,157 +11,165 @@
 
 class DynamicThreadPool {
  public:
-  // 构造函数：核心线程数、最大线程数
-  DynamicThreadPool(size_t core_threads, size_t max_threads)
-      : core_threads_(core_threads),
-        max_threads_(max_threads),
-        is_stop_(false),
-        active_threads_(core_threads) {
-    if (core_threads > max_threads) {
-      throw std::invalid_argument("core threads > max threads");
+  // C++17：inline static constexpr 无需类外定义
+  inline static constexpr std::chrono::seconds IDLE_TIMEOUT =
+      std::chrono::seconds(2);
+
+  // 构造函数：启动核心线程
+  DynamicThreadPool(size_t minThreads, size_t maxThreads)
+      : mMinThreads(minThreads), mMaxThreads(maxThreads), mStopping(false) {
+    if (minThreads > maxThreads) {
+      throw std::invalid_argument(
+          "minThreads cannot be greater than maxThreads");
     }
-    // 启动核心线程（常驻，不销毁）
-    for (size_t i = 0; i < core_threads_; ++i) {
-      threads_.emplace_back(&DynamicThreadPool::core_worker_loop, this);
+    // 启动核心线程（由主线程执行，安全）
+    std::unique_lock<std::mutex> lock(mMutex);
+    for (size_t i = 0; i < minThreads; ++i) {
+      mThreads.emplace_back(&DynamicThreadPool::workerLoop, this);
     }
   }
 
-  // 禁用拷贝移动
-  DynamicThreadPool(const DynamicThreadPool&) = delete;
-  DynamicThreadPool& operator=(const DynamicThreadPool&) = delete;
-  DynamicThreadPool(DynamicThreadPool&&) = delete;
-  DynamicThreadPool& operator=(DynamicThreadPool&&) = delete;
-
-  // 析构函数：优雅关闭
-  ~DynamicThreadPool() { shutdown(); }
+  // 析构函数：安全停止线程池
+  ~DynamicThreadPool() { stop(); }
 
   // 提交任务
-  template <typename F, typename... Args>
-  auto Submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
-    using RetType = decltype(f(args...));
-    auto task = std::make_shared<std::packaged_task<RetType()>>(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
-    std::future<RetType> fut = task->get_future();
-
+  void enqueue(std::function<void()> task) {
     {
-      std::lock_guard<std::mutex> lock(mtx_);
-      if (is_stop_) throw std::runtime_error("pool stopped");
-      tasks_.emplace([task]() { (*task)(); });
+      std::unique_lock<std::mutex> lock(mMutex);
+      if (mStopping) {
+        throw std::runtime_error(
+            "Cannot enqueue task: thread pool is stopping");
+      }
+      mTasks.emplace(std::move(task));
     }
-
-    // 启动临时线程（不超过最大线程数）
-    if (active_threads_.load() < max_threads_) {
-      start_temp_thread();
-    }
-
-    cv_task_.notify_one();
-    return fut;
+    // 唤醒一个空闲线程处理任务
+    mCv.notify_one();
+    // 主线程管理线程池大小（扩容+回收空闲线程）
+    managePoolSize();
   }
-
-  // 获取当前活跃线程数
-  size_t GetActiveThreadCount() const { return active_threads_.load(); }
 
  private:
-  // 核心线程循环（常驻）
-  void core_worker_loop() {
-    while (!is_stop_) {
-      std::function<void()> task;
-      {
-        std::unique_lock<std::mutex> lock(mtx_);
-        cv_task_.wait(lock, [this]() { return !tasks_.empty() || is_stop_; });
-        if (is_stop_ && tasks_.empty()) break;
-        if (tasks_.empty()) continue;
-        task = std::move(tasks_.front());
-        tasks_.pop();
-      }
-      task();
-    }
-  }
+  size_t mMinThreads;                        // 核心线程数（常驻）
+  size_t mMaxThreads;                        // 最大线程数（扩容上限）
+  std::vector<std::thread> mThreads;         // 工作线程列表（仅主线程修改）
+  std::queue<std::function<void()>> mTasks;  // 任务队列
+  std::condition_variable mCv;               // 条件变量：任务/停止通知
+  std::mutex mMutex;                         // 全局互斥锁：保护所有共享资源
+  std::atomic<bool> mStopping;  // 原子变量：线程池停止标记（避免竞态）
 
-  // 临时线程循环（执行完任务后自动退出）
-  void temp_worker_loop() {
-    active_threads_.fetch_add(1);
-    while (!is_stop_) {
+  // 工作线程核心逻辑：仅处理任务，不修改mThreads
+  void workerLoop() {
+    while (!mStopping) {
       std::function<void()> task;
       {
-        std::unique_lock<std::mutex> lock(mtx_);
-        // 临时线程：等待任务或1秒超时（超时则退出）
-        if (!cv_task_.wait_for(lock, std::chrono::seconds(1), [this]() {
-              return !tasks_.empty() || is_stop_;
-            })) {
-          break;  // 超时退出
+        std::unique_lock<std::mutex> lock(mMutex);
+        // 限时等待：超时则退出（缩容）
+        bool hasTask = mCv.wait_for(lock, IDLE_TIMEOUT, [this] {
+          return mStopping || !mTasks.empty();
+        });
+
+        // 场景1：线程池停止 → 退出
+        if (mStopping) {
+          break;
         }
-        if (is_stop_ && tasks_.empty()) break;
-        if (tasks_.empty()) continue;
-        task = std::move(tasks_.front());
-        tasks_.pop();
+
+        // 场景2：超时无任务 → 非核心线程退出（缩容）
+        if (!hasTask) {
+          // 仅当当前线程数>核心线程数时，空闲线程退出
+          // 注意：这里只读取mThreads.size()，不修改！
+          if (mThreads.size() > mMinThreads) {
+            break;
+          } else {
+            continue;  // 核心线程继续等待
+          }
+        }
+
+        // 场景3：有任务 → 取出执行
+        task = std::move(mTasks.front());
+        mTasks.pop();
       }
+
       task();
     }
-    active_threads_.fetch_sub(1);
+    // 工作线程退出：仅自身结束，不修改mThreads！
   }
 
-  // 启动临时线程
-  void start_temp_thread() {
-    std::thread t(&DynamicThreadPool::temp_worker_loop, this);
-    t.detach();  // 临时线程detach，自动管理生命周期
-  }
+  // 停止线程池：主线程统一join所有线程
+  void stop() {
+    mStopping = true;
+    mCv.notify_all();  // 唤醒所有等待的线程
 
-  // 关闭线程池
-  void shutdown() {
-    {
-      std::lock_guard<std::mutex> lock(mtx_);
-      is_stop_ = true;
+    // 主线程统一处理：join所有线程（确保线程退出后再析构）
+    std::unique_lock<std::mutex> lock(mMutex);
+    for (auto& t : mThreads) {
+      if (t.joinable()) {
+        t.join();  // 等待线程执行完毕，此时t.joinable()变为false
+      }
     }
-    cv_task_.notify_all();
-    // 等待核心线程退出
-    for (auto& t : threads_) {
-      if (t.joinable()) t.join();
-    }
+    mThreads.clear();  // 此时erase是安全的（所有线程已join）
   }
 
-  const size_t core_threads_;         // 核心线程数（常驻）
-  const size_t max_threads_;          // 最大线程数
-  std::vector<std::thread> threads_;  // 核心线程列表
-  std::queue<std::function<void()>> tasks_;
-  std::mutex mtx_;
-  std::condition_variable cv_task_;
-  std::atomic<bool> is_stop_;
-  std::atomic<size_t> active_threads_;  // 活跃线程数（核心+临时）
+  // 管理线程池：主线程执行（扩容 + 回收已退出的线程）
+  void managePoolSize() {
+    std::unique_lock<std::mutex> lock(mMutex);
+
+    // 第一步：回收已退出的线程（仅主线程执行，安全！）
+    // 遍历列表，移除所有已退出（!joinable()）的线程
+    auto it =
+        std::remove_if(mThreads.begin(), mThreads.end(), [](std::thread& t) {
+          if (!t.joinable()) {
+            // 线程已退出，析构是安全的
+            return true;
+          }
+          return false;
+        });
+    mThreads.erase(it, mThreads.end());
+
+    // 第二步：扩容逻辑（仅主线程执行）
+    size_t currentThreads = mThreads.size();
+    // 扩容条件：任务数>当前线程数 且 未达最大线程数
+    if (mTasks.size() > currentThreads && currentThreads < mMaxThreads) {
+      // 新增线程（主线程操作，安全）
+      mThreads.emplace_back(&DynamicThreadPool::workerLoop, this);
+    }
+  }
 };
 
-// 测试代码
+// 示例任务：打印线程ID + 模拟耗时
+void exampleTask() {
+  std::cout << "Task executed by thread " << std::this_thread::get_id()
+            << std::endl;
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
 int main() {
-  DynamicThreadPool pool(2, 6);  // 核心2，最大6
+  try {
+    // 创建线程池：核心2个，最大8个
+    DynamicThreadPool pool(2, 8);
 
-  std::cout << "=== 初始状态 ===" << std::endl;
-  std::cout << "核心线程数：2" << std::endl;
-  std::cout << "当前活跃线程数：" << pool.GetActiveThreadCount() << std::endl;
+    // 提交16个任务（触发扩容）
+    std::cout << "=== Submitting 16 tasks ===" << std::endl;
+    for (int i = 0; i < 16; ++i) {
+      pool.enqueue(exampleTask);
+    }
 
-  // 提交10个耗时任务
-  std::vector<std::future<int>> futures;
-  for (int i = 0; i < 10; ++i) {
-    futures.emplace_back(pool.Submit([i]() -> int {
-      std::cout << "Task " << i
-                << " running in thread: " << std::this_thread::get_id()
-                << std::endl;
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      return i;
-    }));
+    // 等待3秒：任务执行完毕 + 空闲线程超时退出（缩容）
+    std::cout << "=== Waiting for idle timeout ===" << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    // 提交2个任务（核心线程处理）
+    std::cout << "=== Submitting 2 more tasks ===" << std::endl;
+    for (int i = 0; i < 2; ++i) {
+      pool.enqueue(exampleTask);
+    }
+
+    // 等待任务执行完毕
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  } catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << std::endl;
+    return 1;
   }
 
-  // 高峰期查看线程数
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-  std::cout << "\n=== 任务高峰期 ===" << std::endl;
-  std::cout << "当前活跃线程数：" << pool.GetActiveThreadCount()
-            << std::endl;  // 最多6
-
-  // 等待任务完成
-  for (auto& fut : futures) fut.get();
-  std::cout << "\n=== 任务完成后 ===" << std::endl;
-  std::this_thread::sleep_for(std::chrono::seconds(2));  // 等待临时线程超时退出
-  std::cout << "当前活跃线程数：" << pool.GetActiveThreadCount()
-            << std::endl;  // 回到2
-
+  std::cout << "=== Program exited normally ===" << std::endl;
   return 0;
 }
